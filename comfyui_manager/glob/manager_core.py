@@ -117,9 +117,6 @@ def get_script_env():
     return new_env
 
 
-invalid_nodes = {}
-
-
 def extract_base_custom_nodes_dir(x:str):
     if os.path.dirname(x).endswith('.disabled'):
         return os.path.dirname(os.path.dirname(x))
@@ -130,46 +127,14 @@ def extract_base_custom_nodes_dir(x:str):
 
 
 def check_invalid_nodes():
-    global invalid_nodes
-
-    try:
-        import folder_paths
-    except Exception:
-        try:
-            sys.path.append(context.comfy_path)
-            import folder_paths
-        except Exception:
-            raise Exception(f"Invalid COMFYUI_FOLDERS_BASE_PATH: {context.comfy_path}")
-
-    def check(root):
-        global invalid_nodes
-
-        subdirs = [d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]
-        for subdir in subdirs:
-            if subdir in ['.disabled', '__pycache__']:
-                continue
-
-            package = unified_manager.installed_node_packages.get(subdir)
-            if not package:
-                continue
-
-            if not package.isValid():
-                invalid_nodes[subdir] = package.fullpath
-
-    node_paths = folder_paths.get_folder_paths("custom_nodes")
-    for x in node_paths:
-        check(x)
-
-        disabled_dir = os.path.join(x, '.disabled')
-        if os.path.exists(disabled_dir):
-            check(disabled_dir)
-
-    if len(invalid_nodes):
+    """Print the invalid installations that the last `unified_manager.reload()` found."""
+    if unified_manager.invalid_nodes:
         print("\n-------------------- ComfyUI-Manager invalid nodes notice ----------------")
-        print("\nNodes requiring reinstallation have been detected:\n(Directly delete the corresponding path and reinstall.)\n")
+        print("\nNodes requiring reinstallation have been detected:\nThese nodepacks were not installed through ComfyUI-Manager, or their installation is damaged, so the Manager cannot update them.\nReinstalling one in the Manager deletes its folder and installs the nodepack again.\n")
 
-        for x in invalid_nodes.values():
-            print(x)
+        for paths in unified_manager.invalid_nodes.values():
+            for x in paths:
+                print(x)
 
         print("\n---------------------------------------------------------------------------\n")
 
@@ -326,6 +291,7 @@ class UnifiedManager:
         self.unknown_inactive_nodes = {}                    # node_id -> repo url * fullpath
         self.active_nodes = NormalizedKeyDict()             # node_id -> node_version * fullpath
         self.unknown_active_nodes = {}                      # node_id -> repo url * fullpath
+        self.invalid_nodes = {}                             # node_id -> [fullpath]: folders with neither .git nor .tracking
         self.cnr_map = NormalizedKeyDict()                  # node_id -> cnr info
         self.repo_cnr_map = {}                              # repo_url -> cnr info
         self.custom_node_map_cache = {}                     # (channel, mode) -> augmented custom node list json
@@ -485,9 +451,29 @@ class UnifiedManager:
             else:
                 return None
 
-    def update_cache_at_path(self, fullpath):
+    def read_node_package(self, fullpath):
+        """
+        The package at fullpath. An invalid installation is identified as
+        1. the registry id that is `[project].name` of its pyproject.toml,
+        2. the registry id that is its folder name,
+        3. its folder name.
+        """
         node_package = InstalledNodePackage.from_fullpath(fullpath, self.resolve_from_path)
+        if not node_package.isValid():
+            for name in (cnr_utils.read_project_name(fullpath), node_package.id):
+                cnr = self.cnr_map.get(name) if name else None
+                if cnr is not None:
+                    node_package.id = cnr['id']
+                    break
+
+        return node_package
+
+    def update_cache_at_path(self, fullpath):
+        node_package = self.read_node_package(fullpath)
         self.installed_node_packages[node_package.id] = node_package
+
+        if not node_package.isValid():
+            self.invalid_nodes.setdefault(node_package.id, []).append(fullpath)
 
         if node_package.is_disabled and node_package.is_unknown:
             url = git_utils.git_url(node_package.fullpath)
@@ -540,7 +526,8 @@ class UnifiedManager:
             futures = []
 
             for k, v in self.unknown_active_nodes.items():
-                futures.append(executor.submit(check_update, k, v[1], 'unknown'))
+                if v[1] not in self.invalid_nodes.get(k, ()):
+                    futures.append(executor.submit(check_update, k, v[1], 'unknown'))
 
             for k, v in self.active_nodes.items():
                 if v[0] == 'nightly':
@@ -666,6 +653,7 @@ class UnifiedManager:
         self.unknown_inactive_nodes = {}  # node_id -> repo url * fullpath
         self.unknown_active_nodes = {}    # node_id -> repo url * fullpath
         self.active_nodes = NormalizedKeyDict()            # node_id -> node_version * fullpath
+        self.invalid_nodes = {}           # node_id -> [fullpath]
 
         if get_config()['network_mode'] != 'public' or manager_util.is_manager_pip_package():
             dont_wait = True
@@ -1145,11 +1133,21 @@ class UnifiedManager:
         if 'comfyui-manager' in node_id.lower():
             return result.fail(f"ignored: uninstalling '{node_id}'")
 
+        # the invalid installations of the pack, which are kept among the unknown nodes
+        for fullpath in self.invalid_nodes.pop(node_id, []):
+            for nodes in (self.unknown_active_nodes, self.unknown_inactive_nodes):
+                if node_id in nodes and nodes[node_id][1] == fullpath:
+                    del nodes[node_id]
+
+            if os.path.exists(fullpath):
+                try_rmtree(node_id, fullpath)
+                result.append(fullpath if is_unknown else ('unknown', fullpath))
+
         if is_unknown:
             # remove from actives
             repo_and_path = self.unknown_active_nodes.get(node_id)
 
-            is_removed = False
+            is_removed = len(result.items) > 0
 
             if repo_and_path is not None and os.path.exists(repo_and_path[1]):
                 rmtree(repo_and_path[1])
@@ -1399,6 +1397,11 @@ class UnifiedManager:
         if version_spec is None:
             version_spec = self.resolve_unspecified_version(node_id, guess_mode='active')
 
+        active = self.unknown_active_nodes.get(node_id) if version_spec == 'unknown' else self.active_nodes.get(node_id)
+        if node_id in self.invalid_nodes and (active is None or active[1] in self.invalid_nodes[node_id]):
+            paths = ', '.join(self.invalid_nodes[node_id])
+            return ManagedResult('update').fail(f"Cannot update '{node_id}': this nodepack was not installed through ComfyUI-Manager, or its installation is damaged, so the Manager cannot update it. Reinstalling deletes its folder ({paths}) and installs the nodepack again.").with_target(version_spec).with_ver('unknown')
+
         if version_spec is None:
             return ManagedResult('update').fail(f'Update not available: {node_id}@{version_spec}').with_ver(version_spec)
 
@@ -1459,29 +1462,11 @@ class UnifiedManager:
 
         if version_spec == 'unknown' or version_spec == 'nightly':
             try:
-                custom_nodes = await self.get_custom_nodes(channel, mode)
-            except InvalidChannel as e:
-                return ManagedResult('fail').fail(f'Invalid channel is used: {e.channel}')
-
-            the_node = custom_nodes.get(node_id)
-            if the_node is not None:
-                if version_spec == 'unknown':
-                    repo_url = the_node['files'][0]
-                else:  # nightly
-                    repo_url = the_node['repository']
-            else:
-                # Fallback for nightly only: use repository URL from CNR map
-                # when node is registered in CNR but absent from nightly manifest
-                if version_spec == 'nightly':
-                    cnr_fallback = self.cnr_map.get(node_id)
-                    if cnr_fallback is not None and cnr_fallback.get('repository'):
-                        repo_url = cnr_fallback['repository']
-                    else:
-                        result = ManagedResult('install')
-                        return result.fail(f"Node '{node_id}@{version_spec}' not found in [{channel}, {mode}]")
-                else:
-                    result = ManagedResult('install')
-                    return result.fail(f"Node '{node_id}@{version_spec}' not found in [{channel}, {mode}]")
+                repo_url = await self._get_git_install_url(node_id, version_spec, channel, mode)
+            except InvalidChannel as exc:
+                return ManagedResult('fail').fail(f'Invalid channel is used: {exc.channel}')
+            except LookupError as exc:
+                return ManagedResult('install').fail(str(exc))
 
         if self.is_enabled(node_id, version_spec):
             return ManagedResult('skip').with_target(f"{node_id}@{version_spec}")
@@ -1522,6 +1507,51 @@ class UnifiedManager:
 
         return res
 
+    async def _get_git_install_url(self, node_id, version_spec, channel, mode):
+        custom_nodes = await self.get_custom_nodes(channel, mode)
+        node = custom_nodes.get(node_id)
+        if node is not None:
+            return node['files'][0] if version_spec == 'unknown' else node['repository']
+        if version_spec == 'nightly':
+            cnr = self.cnr_map.get(node_id)
+            if cnr is not None and cnr.get('repository'):
+                return cnr['repository']
+        raise LookupError(f"Node '{node_id}@{version_spec}' not found in [{channel}, {mode}]")
+
+    async def reinstall_by_id(self, node_id, version_spec, channel=None, mode=None):
+        if 'comfyui-manager' in node_id.lower():
+            return ManagedResult('skip').fail(f"ignored: installing '{node_id}'")
+
+        if version_spec in ('unknown', 'nightly'):
+            try:
+                repo_url = await self._get_git_install_url(node_id, version_spec, channel, mode)
+            except InvalidChannel as exc:
+                return ManagedResult('fail').fail(f'Invalid channel is used: {exc.channel}')
+            except LookupError as exc:
+                return ManagedResult('install').fail(str(exc))
+        else:
+            try:
+                node_info = self._get_cnr_install_info(node_id, version_spec)
+            except PermissionError as exc:
+                return ManagedResult('install-cnr').fail(str(exc))
+            if node_info is None or not node_info.download_url:
+                return ManagedResult('install-cnr').fail(f'not available node: {node_id}@{version_spec}')
+
+        removed = self.unified_uninstall(node_id, version_spec == 'unknown')
+        if not removed.result:
+            return removed
+
+        for item in removed.items:
+            path = item if version_spec == 'unknown' else item[1]
+            self.processed_install.discard(os.path.join(path, 'install.py'))
+        if version_spec in ('unknown', 'nightly'):
+            return self._install_git(node_id, version_spec, repo_url)
+
+        result = self._cnr_install(node_id, node_info)
+        if result.result:
+            self.active_nodes[node_id] = node_info.version, result.to_path
+        return result
+
 
 unified_manager = UnifiedManager()
 
@@ -1558,6 +1588,22 @@ def identify_node_pack_from_path(fullpath):
             return module_name, commit_hash, '', github_id
 
 
+def installed_pack_entry(fullpath, enabled):
+    """(folder name, entry of the installed map) for the nodepack folder at fullpath, or None."""
+    info = identify_node_pack_from_path(fullpath)
+    if info is not None:
+        return info[0], { 'ver': info[1], 'cnr_id': info[2], 'aux_id': info[3], 'enabled': enabled }
+
+    if os.path.isdir(fullpath):
+        node_package = unified_manager.read_node_package(fullpath)
+        if not node_package.isValid():
+            # the page may ask before the registry list is loaded: then the pack's own [project].name tells it
+            cnr_id = node_package.id if node_package.id in unified_manager.cnr_map else (cnr_utils.read_project_name(fullpath) or '').lower()
+            return os.path.basename(fullpath), { 'ver': 'unknown', 'cnr_id': cnr_id, 'aux_id': None, 'enabled': enabled, 'invalid_installation': True }
+
+    return None
+
+
 def get_installed_node_packs():
     res = {}
 
@@ -1566,14 +1612,9 @@ def get_installed_node_packs():
             if y == '__pycache__' or y == '.disabled':
                 continue
 
-            fullpath = os.path.join(x, y)
-            info = identify_node_pack_from_path(fullpath)
-            if info is None:
-                continue
-
-            is_disabled = not y.endswith('.disabled')
-
-            res[info[0]] = { 'ver': info[1], 'cnr_id': info[2], 'aux_id': info[3], 'enabled': is_disabled }
+            entry = installed_pack_entry(os.path.join(x, y), not y.endswith('.disabled'))
+            if entry is not None:
+                res[entry[0]] = entry[1]
 
         disabled_dirs = os.path.join(x, '.disabled')
         if os.path.exists(disabled_dirs):
@@ -1581,15 +1622,11 @@ def get_installed_node_packs():
                 if y == '__pycache__':
                     continue
 
-                fullpath = os.path.join(disabled_dirs, y)
-                info = identify_node_pack_from_path(fullpath)
-                if info is None:
-                    continue
+                entry = installed_pack_entry(os.path.join(disabled_dirs, y), False)
 
                 # NOTE: don't add disabled nodepack if there is enabled nodepack
-                original_name = info[0].split('@')[0]
-                if original_name not in res:
-                    res[info[0]] = { 'ver': info[1], 'cnr_id': info[2], 'aux_id': info[3], 'enabled': False }
+                if entry is not None and entry[0].split('@')[0] not in res:
+                    res[entry[0]] = entry[1]
 
     return res
 
@@ -2992,7 +3029,7 @@ async def get_unified_total_nodes(channel, mode, regsitry_cache_mode='cache'):
             updatable = False
             cnr = unified_manager.cnr_map[cnr_id]
 
-            if cnr_id in invalid_nodes:
+            if cnr_id in unified_manager.invalid_nodes:
                 v['invalid-installation'] = True
 
             if cnr_id in unified_manager.active_nodes:
@@ -3021,6 +3058,9 @@ async def get_unified_total_nodes(channel, mode, regsitry_cache_mode='cache'):
                 # disabled
                 v['state'] = 'disabled'
                 v['version'] = 'nightly'
+            elif cnr_id in unified_manager.invalid_nodes:
+                # only an invalid installation, which ComfyUI loads unless it is disabled
+                v['state'] = 'enabled' if cnr_id in unified_manager.unknown_active_nodes else 'disabled'
             else:
                 # not installed
                 v['state'] = 'not-installed'
@@ -3032,6 +3072,9 @@ async def get_unified_total_nodes(channel, mode, regsitry_cache_mode='cache'):
         else:
             # unknown version
             v['version'] = 'unknown'
+
+            if k in unified_manager.invalid_nodes:
+                v['invalid-installation'] = True
 
             if unified_manager.is_enabled(k, 'unknown'):
                 v['state'] = 'enabled'
@@ -3078,6 +3121,9 @@ async def get_unified_total_nodes(channel, mode, regsitry_cache_mode='cache'):
                 # disabled
                 state = 'disabled'
                 ver = 'nightly'
+            elif cnr_id in unified_manager.invalid_nodes:
+                # only an invalid installation, which ComfyUI loads unless it is disabled
+                state = 'enabled' if cnr_id in unified_manager.unknown_active_nodes else 'disabled'
             else:
                 # not installed
                 state = 'not-installed'
@@ -3093,6 +3139,9 @@ async def get_unified_total_nodes(channel, mode, regsitry_cache_mode='cache'):
 
             if import_fail:
                 item['import-fail'] = True
+
+            if cnr_id in unified_manager.invalid_nodes:
+                item['invalid-installation'] = True
 
             res[cnr_id] = item
 

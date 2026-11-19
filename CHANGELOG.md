@@ -22,6 +22,26 @@ and this project adheres to [Semantic Versioning 2.0.0](https://semver.org/spec/
 - A clone of a snapshot restore that is refused says why in the log, as
   `Invalid git url: ...`. The summary said `[  FAILED   ]` with no word of
   why.
+- A nodepack that was not installed through ComfyUI-Manager, or whose
+  installation is damaged, is an invalid installation, and the Manager fixes
+  it by reinstalling the nodepack (#3330). Such a folder has neither `.git`
+  nor `.tracking`: an install broke midway, or a download was unpacked by
+  hand. It was taken for a git nodepack: Update All ran a git update on it and
+  logged `ERROR: An error occurred while updating ...`, the nodepack showed as
+  not installed, and installing it again failed with
+  `Install path already exists`. Update All now leaves it alone, the node list
+  shows the row of its nodepack as installed, marked `INVALID INSTALLATION ↗`
+  (hover it or click it for what that means) with a Reinstall button that
+  says what it does, `/v2/customnode/installed` lists it with
+  `invalid_installation: true` and its nodepack as `cnr_id`, and a reinstall
+  (`kind: "reinstall"` in `/v2/manager/queue/task`) deletes the folder and
+  installs the nodepack again. The nodepack is the registry id that
+  `[project].name` of its `pyproject.toml` or its folder name names, otherwise
+  the folder name. `/v2/customnode/installed` tells a nodepack that its
+  `pyproject.toml` names without waiting for the registry list to load. The
+  startup notice that lists such folders now appears; it looked for them
+  before the folders were read.
+- The console line of a failed update says why the update failed.
 
 ## [4.4.2] - 2026-11-19
 

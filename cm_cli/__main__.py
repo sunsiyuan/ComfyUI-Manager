@@ -75,7 +75,6 @@ def check_comfyui_hash():
 
 
 check_comfyui_hash()  # This is a preparation step for manager_core
-core.check_invalid_nodes()
 
 
 def read_downgrade_blacklist():
@@ -130,6 +129,7 @@ class Ctx:
             self.channel = channel
 
         asyncio.run(unified_manager.reload(cache_mode=self.mode, dont_wait=False))
+        core.check_invalid_nodes()
         asyncio.run(unified_manager.load_nightly(self.channel, self.mode))
 
     def set_no_deps(self, no_deps):
