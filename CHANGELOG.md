@@ -2,6 +2,29 @@
 
 ## Unreleased
 
+### A nodepack not installed through the Manager, or damaged, is an invalid installation, fixed by reinstalling
+
+A nodepack that was not installed through ComfyUI-Manager, or whose
+installation is damaged, is one the Manager can neither update nor tell the
+version of (#3330). Such a folder has neither `.git` nor `.tracking`: an
+install broke midway, or a download was unpacked by hand. It was taken for a
+git nodepack: Update All ran a git update on it and logged
+`ERROR: An error occurred while updating ...`, the nodepack showed as not
+installed, and installing it again failed with `Install path already exists`.
+Update All now leaves it alone, the row of its nodepack in the Custom Nodes
+Manager shows as installed, marked `INVALID INSTALLATION ↗` (hover it or click
+it for what that means) with a Reinstall button that says what it does, and
+has its own filter, `/customnode/installed` lists it with
+`invalid_installation: true` and its nodepack as `cnr_id`, and the reinstall
+deletes the folder and installs the nodepack again. The nodepack is the
+registry id that `[project].name` of its `pyproject.toml` or its folder name
+names, otherwise the folder name. `/customnode/installed` tells a nodepack
+that its `pyproject.toml` names without waiting for the registry list to load.
+The startup notice that lists such folders now appears; it looked for them
+before the folders were read.
+
+The console line of a failed update says why the update failed.
+
 ### A snapshot restore installs a git node pack as the snapshot names it
 
 A snapshot names a git node pack by its url. For a url that the registry

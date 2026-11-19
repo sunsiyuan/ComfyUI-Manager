@@ -39,10 +39,11 @@ class InstalledNodePackage:
         return get_commit_hash(self.fullpath)
 
     def isValid(self) -> bool:
-        if self.is_from_cnr:
-            return os.path.exists(os.path.join(self.fullpath, '.tracking'))
+        # The Manager does not manage its own folder.
+        if 'comfyui-manager' in self.id.lower():
+            return True
 
-        return True
+        return os.path.exists(os.path.join(self.fullpath, '.git')) or os.path.exists(os.path.join(self.fullpath, '.tracking'))
 
     @staticmethod
     def from_fullpath(fullpath: str, resolve_from_path) -> InstalledNodePackage:
